@@ -1,12 +1,11 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 #[doc(hidden)]
 pub mod macro_internals {
     use core::{
-        cell::Cell,
         future::Future,
         marker::PhantomData,
-        mem::{transmute, ManuallyDrop},
+        mem::{transmute, ManuallyDrop, MaybeUninit},
         pin::Pin,
         ptr,
         task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -46,6 +45,7 @@ pub mod macro_internals {
     pub struct SelfRef<T: ?Sized, F> {
         _ty: PhantomData<fn(T) -> T>,
         future: F,
+        did_read: bool,
     }
 
     impl<T, F> SelfRef<T, F>
@@ -61,20 +61,20 @@ pub mod macro_internals {
             Self {
                 _ty: PhantomData,
                 future: generator(SelfRefProvider { _ty: PhantomData }),
+                did_read: false,
             }
         }
 
         #[inline(always)]
         pub fn get<'a>(self: Pin<&'a mut Self>) -> Feed<'a, T> {
-            let future = unsafe {
-                // Safety: `future` is structurally pinned, we decided.
-                self.map_unchecked_mut(|me| &mut me.future)
-            };
+            // Safety: all our fields are structurally pinned, we decided.
+            let me = unsafe { self.get_unchecked_mut() };
+            let future = unsafe { Pin::new_unchecked(&mut me.future) };
 
             // Create a context with a dummy waker.
             // N.B. We wrap our waker in a `SelfRefProviderFuture` to ensure that early returns don't
             // cause issues.
-            let dummy_waker = SelfRefProviderFuture::<Feed<'a, T>>(dummy_waker(), Cell::new(None));
+            let dummy_waker = SelfRefProviderFuture::<Feed<'a, T>>(dummy_waker(), None);
 
             let mut context = Context::from_waker(&dummy_waker.0);
 
@@ -99,18 +99,32 @@ pub mod macro_internals {
                 // identical, they are still assignable to one another.
                 //
                 // Hence, it is valid to reinterpret our `&Waker` as a `&SelfRefProviderFuture`.
-                //
-                // FIXME: Miri reports this line as being U.B., presumably because we're extending
-                //  a borrowed region beyond where it was originally meant to exist. Unfortunately,
-                //  this U.B. is going to have to stay so long as `waker_getters` (#96992) remains
-                //  unstable because I can't think of any other `no_std` way of gaining access to
-                //  that state. Sorry!
-                &*(context.waker() as *const Waker).cast::<SelfRefProviderFuture<Feed<'a, T>>>()
+                &*(context.waker() as *const Waker as *const SelfRefProviderFuture<Feed<'a, T>>)
             };
 
             // Fetch the data from the future.
-            data.replace(None)
-                .expect("Cannot call `SelfRef::get` more than once.")
+            assert!(!me.did_read, "`SelfRef::get()` can only be called once!");
+            me.did_read = true;
+
+            unsafe {
+                // Safety: we can only read from this structure once so the copy to take ownership
+                // is fine.
+
+                // N.B. we perform a bitwise copy against a `MaybeUninit` rather than stealing from
+                // a `Cell` because, although we can safely access the original memory referenced by
+                // our `SelfRefProviderFuture` pointer because of magical reasons (confusing tree
+                // borrow magic?), we have lost knowledge of the fact that the value exhibits interior
+                // mutability (consider what would happen if we took an immutable reference to a value
+                // in an `UnsafeCell` and then tried to mutate from that reference; that would clearly
+                // be very bad!) and therefore cannot mutate any values derived from it.
+                //
+                // Anyways, this code passes Miri given `MIRIFLAGS=-Zmiri-tree-borrows` so I'm
+                // relatively happy with this hack for now.
+                data
+					.as_ref()
+					.expect("`SelfRef` provider never provided a value. Was there an unexpected early return?")
+					.assume_init_read()
+            }
         }
     }
 
@@ -131,7 +145,7 @@ pub mod macro_internals {
         //
         #[inline(always)]
         pub async unsafe fn provide(self, output: Feed<'_, T>) {
-            SelfRefProviderFuture(dummy_waker(), Cell::new(Some(output))).await;
+            SelfRefProviderFuture(dummy_waker(), Some(MaybeUninit::new(output))).await;
         }
 
         // Many thanks to Yandros for the macro help!
@@ -147,7 +161,7 @@ pub mod macro_internals {
     }
 
     #[repr(C)]
-    struct SelfRefProviderFuture<T>(ManuallyDrop<Waker>, Cell<Option<T>>);
+    struct SelfRefProviderFuture<T>(ManuallyDrop<Waker>, Option<MaybeUninit<T>>);
 
     impl<T> Unpin for SelfRefProviderFuture<T> {}
 
@@ -221,4 +235,66 @@ macro_rules! self_ref {
             impl $crate::macro_internals::re_export::Future<Output = ()> $(+ $future_lt)?,
         >
     };
+}
+
+#[cfg(test)]
+mod test {
+    use std::{cell::RefCell, iter::Copied, pin::pin, rc::Rc, slice};
+
+    use super::self_ref;
+
+    fn returns_a_slice() -> self_ref![for<'a> (&'a u32, &'a [u32])] {
+        self_ref!(use target in {
+            let slice = [3, 2, 1, 0];
+            let target = slice.split_last().unwrap();
+        })
+    }
+
+    fn locks_a_guard<T: Copy>(
+        a: &Rc<RefCell<Vec<T>>>,
+    ) -> self_ref![for<'a> (&'a T, Copied<slice::Iter<'a, T>>); '_] {
+        self_ref!(use target in {
+            let a = a.borrow();
+            let (last, earlier) = a.split_first().unwrap();
+            let target = (last, earlier.iter().copied());
+        })
+    }
+
+    #[test]
+    fn simple_usage() {
+        let result = pin!(returns_a_slice());
+        let (value, my_slice) = result.get();
+        assert_eq!(*value, 0);
+        assert_eq!(my_slice, &[3, 2, 1]);
+
+        let my_cell = Rc::new(RefCell::new(my_slice.to_vec()));
+        {
+            let result = pin!(locks_a_guard(&my_cell));
+            let (first, mut remaining_iter) = result.get();
+
+            assert_eq!(*first, 3);
+            assert_eq!(remaining_iter.next(), Some(2));
+            assert_eq!(remaining_iter.next(), Some(1));
+            assert_eq!(remaining_iter.next(), None);
+        }
+        let exclusive = my_cell.borrow_mut();
+        assert_eq!(exclusive.as_slice(), &[3, 2, 1]);
+    }
+
+    fn never_returns_anything() -> self_ref![for<'a> &'a u32] {
+        self_ref!(use t in {
+            if true {
+                return;
+            }
+
+            let t = &3;
+        })
+    }
+
+    #[test]
+    #[should_panic]
+    fn early_return() {
+        let value = pin!(never_returns_anything());
+        value.get();
+    }
 }
