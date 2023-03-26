@@ -31,10 +31,13 @@ pub mod macro_internals {
             |_data| {},
         );
 
-        ManuallyDrop::new(unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) })
+        ManuallyDrop::new(unsafe {
+            // Safety: this is a trivial dummy waker satisfying its own invariants.
+            Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE))
+        })
     }
 
-    type Feed<'a, T_> = <T_ as SelfRefOutput<'a>>::Output;
+    type Feed<'a, T> = <T as SelfRefOutput<'a>>::Output;
 
     pub trait SelfRefOutput<'a>: sealed::CannotBeImplemented {
         type Output;
@@ -96,6 +99,12 @@ pub mod macro_internals {
                 // identical, they are still assignable to one another.
                 //
                 // Hence, it is valid to reinterpret our `&Waker` as a `&SelfRefProviderFuture`.
+                //
+                // FIXME: Miri reports this line as being U.B., presumably because we're extending
+                //  a borrowed region beyond where it was originally meant to exist. Unfortunately,
+                //  this U.B. is going to have to stay so long as `waker_getters` (#96992) remains
+                //  unstable because I can't think of any other `no_std` way of gaining access to
+                //  that state. Sorry!
                 &*(context.waker() as *const Waker).cast::<SelfRefProviderFuture<Feed<'a, T>>>()
             };
 
