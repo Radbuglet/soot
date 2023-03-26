@@ -178,38 +178,38 @@ pub mod macro_internals {
 #[macro_export]
 macro_rules! self_ref {
     (use $provided:ident in { $($rest:tt)* }) => {
-		$crate::macro_internals::SelfRef::new(|__self_ref_internal_and_very_unsafe_provider| async move {
-			__self_ref_internal_and_very_unsafe_provider.check_covariance(|_, x| x);
+        $crate::macro_internals::SelfRef::new(|__self_ref_internal_and_very_unsafe_provider| async move {
+            __self_ref_internal_and_very_unsafe_provider.check_covariance(|_, x| x);
 
-			$($rest)*
+            $($rest)*
 
-			// This block protects us from trailing closures.
-			{};
+            // This block protects us from trailing closures.
+            {};
 
-			unsafe {
-				// Safety:
-				//
-				// - We are guaranteed to be executing in an appropriate context because this `async`
-				//   block is given directly to `SelfRef` and all token trees are balanced so `$rest`
-				//   could not have moved us into a different async block. We know that this is the
-				//   appropriate `__self_ref_internal_and_very_unsafe_provider` with the appropriate
-				//   type for the closure because no one else could have bound to this variable
-				//   without being particularly malicious, at which point we can't help them.
-				//
-				// - We've already proven that `T` is covariant through `check_covariance`.
-				//
-				// - Because we're executing in the main `async` block and `provide` is inherently
-				//   blocking, we know that the entire future will be blocked as long as we provide
-				//   `$provided` to the caller.
-				//
-				__self_ref_internal_and_very_unsafe_provider.provide($provided).await;
-			}
-		})
-	};
-	(for<$lt:lifetime> $ty:ty $(; $future_lt:lifetime)?) => {
-		$crate::macro_internals::SelfRef<
-			dyn for<$lt> $crate::macro_internals::SelfRefOutput<$lt, Output = $ty>,
-			impl $crate::macro_internals::re_export::Future<Output = ()> $(+ $future_lt)?,
-		>
-	};
+            unsafe {
+                // Safety:
+                //
+                // - We are guaranteed to be executing in an appropriate context because this `async`
+                //   block is given directly to `SelfRef` and all token trees are balanced so `$rest`
+                //   could not have moved us into a different async block. We know that this is the
+                //   appropriate `__self_ref_internal_and_very_unsafe_provider` with the appropriate
+                //   type for the closure because no one else could have bound to this variable
+                //   without being particularly malicious, at which point we can't help them.
+                //
+                // - We've already proven that `T` is covariant through `check_covariance`.
+                //
+                // - Because we're executing in the main `async` block and `provide` is inherently
+                //   blocking, we know that the entire future will be blocked as long as we provide
+                //   `$provided` to the caller.
+                //
+                __self_ref_internal_and_very_unsafe_provider.provide($provided).await;
+            }
+        })
+    };
+    (for<$lt:lifetime> $ty:ty $(; $future_lt:lifetime)?) => {
+        $crate::macro_internals::SelfRef<
+            dyn for<$lt> $crate::macro_internals::SelfRefOutput<$lt, Output = $ty>,
+            impl $crate::macro_internals::re_export::Future<Output = ()> $(+ $future_lt)?,
+        >
+    };
 }

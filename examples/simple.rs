@@ -1,8 +1,3 @@
-# Soot
-
-**S**elf **O**bject **o**f **T**error - A library to create self-referential objects without unsafe blocks or boilerplate.
-
-```rust
 use std::{cell::RefCell, iter::Copied, pin::pin, rc::Rc, slice};
 
 use soot::self_ref;
@@ -40,8 +35,6 @@ fn main() {
         assert_eq!(remaining_iter.next(), Some(1));
         assert_eq!(remaining_iter.next(), None);
     }
-
     let exclusive = my_cell.borrow_mut();
     assert_eq!(exclusive.as_slice(), &[3, 2, 1]);
 }
-```
