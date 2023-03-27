@@ -3,13 +3,11 @@
 #[doc(hidden)]
 pub mod macro_internals {
     use core::{
-        cell::RefCell,
         future::Future,
-        iter,
         marker::PhantomData,
         mem::{transmute, ManuallyDrop, MaybeUninit},
         pin::Pin,
-        ptr,
+        ptr::{self, NonNull},
         task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     };
 
@@ -36,8 +34,9 @@ pub mod macro_internals {
     /// Fetches the output type of a [`SelfRefOutput`] given the lifetime `'a`.
     type Feed<'a, T> = <T as SelfRefOutput<'a>>::Output;
 
-    /// Fetches the output type of a [`SelfRefIterOutput`] given the lifetime `'a`.
-    type FeedIter<'a, T> = <T as SelfRefIterOutput<'a>>::IterOutput;
+    mod sealed {
+        pub trait CannotBeImplemented {}
+    }
 
     /// A trait used to indicate the return type of a [`SelfRef`] given a future lifetime `'a`.
     ///
@@ -45,7 +44,7 @@ pub mod macro_internals {
     /// ```ignore
     /// type MyOutputCollection = dyn for<'a> SelfRefOutput<'a, Output = &'a u32>;
     /// ```
-    pub trait SelfRefOutput<'a> {
+    pub trait SelfRefOutput<'a>: sealed::CannotBeImplemented {
         // N.B. this does not need to be `'a` because we prove the validity of our lifetime
         // indirectly by observing that:
         //
@@ -53,19 +52,6 @@ pub mod macro_internals {
         // b) The lifetime `'a` in `SelfRefProvider::provide(Feed<'a, T>)` outlives the lifetime
         //    `'b` in `SelfRef::get_streaming(Pin<&'b Self>)`.
         type Output;
-    }
-
-    /// A trait used to indicate the return type of a [`SelfRef`] being used as an iterator given a
-    /// future lifetime `'a`. Everything that implements [`SelfRefIterOutput`] also implements
-    /// [`SelfRefOutput`] with an output of `Option<IterOutput>`.
-    ///
-    /// See [`SelfRefOutput`] documentation for how to use this trait.
-    pub trait SelfRefIterOutput<'a> {
-        type IterOutput;
-    }
-
-    impl<'a, T: ?Sized + SelfRefIterOutput<'a>> SelfRefOutput<'a> for T {
-        type Output = Option<T::IterOutput>;
     }
 
     /// A new-type wrapper around a future producing self-referential data. This is constructed
@@ -77,7 +63,7 @@ pub mod macro_internals {
     /// `F` represents the [`Future`] being used to produce these values.
     pub struct SelfRef<T: ?Sized, F> {
         _ty: PhantomData<fn(T) -> T>,
-        future: RefCell<F>,
+        future: F,
     }
 
     impl<T, F> SelfRef<T, F>
@@ -95,21 +81,18 @@ pub mod macro_internals {
         {
             Self {
                 _ty: PhantomData,
-                future: RefCell::new(generator(SelfRefProvider { _ty: PhantomData })),
+                future: generator(SelfRefProvider { _ty: PhantomData }),
             }
         }
 
         #[inline(always)]
-        pub fn get_streaming<'a>(self: Pin<&'a Self>) -> Feed<'a, T> {
-            // N.B. we use a `RefCell` here because someone could technically call this function
-            // recursively, although they'd have considerable difficulty doing so.
-            let future = &mut *self.future.borrow_mut();
+        pub fn get<'a>(self: Pin<&'a mut Self>) -> Feed<'a, T> {
             let future = unsafe {
                 // Safety: If `F: !Unpin`, then a `Pin` wrapper around a reference guarantees that
                 // our structure, will not be moved. Because we never give out mutable references to
                 // our future to anyone else, the future will also stay put. Huzzah for structural
                 // pinning!
-                Pin::new_unchecked(future)
+                self.map_unchecked_mut(|me| &mut me.future)
             };
 
             // Construct a waker surrounded by a `SelfRefProviderFuture`. We do this to setup the
@@ -175,6 +158,9 @@ pub mod macro_internals {
                 //      established prior, we know that `SelfRefProvider<Feed<'b, T>>` is assignable
                 //      to our `SelfRefProvider<Feed<'a, T>>`, as expected.
                 //
+                //      Note that enforcing this is somewhat tricky. See the safety docs of
+                //      `SelfRefProvider::provide()` for more details.
+                //
                 // 3.   TODO: Justify why this type of C-style structure embedding is valid in Rust—
                 //       even with obnoxious pointer-reference round-tripping. (right now, my only
                 //       source of confidence for this operation is the fact that Miri with
@@ -206,29 +192,6 @@ pub mod macro_internals {
                 output.assume_init_read()
             }
         }
-
-        #[inline(always)]
-        pub fn get<'a>(self: Pin<&'a mut Self>) -> Feed<'a, T> {
-            self.into_ref().get_streaming()
-        }
-    }
-
-    impl<T, F> SelfRef<T, F>
-    where
-        T: ?Sized + for<'a> SelfRefIterOutput<'a>,
-        F: Future<Output = ()>,
-    {
-        #[inline(always)]
-        pub fn iter_streaming<'a>(
-            self: Pin<&'a Self>,
-        ) -> impl Iterator<Item = FeedIter<'a, T>> + 'a {
-            iter::from_fn(move || self.get_streaming())
-        }
-
-        #[inline(always)]
-        pub fn iter<'a>(self: Pin<&'a mut Self>) -> impl Iterator<Item = FeedIter<'a, T>> + 'a {
-            self.into_ref().iter_streaming()
-        }
     }
 
     /// A helper structure providing access to [`SelfRefOutput`] variance checking and type-safe
@@ -248,13 +211,17 @@ pub mod macro_internals {
         /// 2. `Feed<'a, T>` must be covariant w.r.t `'a`.
         ///
         /// 3. The lifetime `'a` for the `output: Feed<'a, T>` argument must not expire before the
-        ///    async block in which this future is being `.await`ed is dropped. The theoretical lifetime
+        ///    `async` block in which this future is being `.await`ed is dropped. The theoretical lifetime
         ///    of the value can be proven in a macro by defining a mutable refererence to `()` that lives
         ///    for the entire scope of the `async` block and passing a mutable reference to that as the
         ///    `_lifetime_proof`. Because `&mut T` is invariant w.r.t `T`, the pointee `T` cannot be
         ///    lengthened or shortened, binding `'a` to the propper duration. To prove that this theoretical
-        ///    lifetime is the value's actual lifetime, the caller must then simply guarantee that the
-        ///    future will never terminate without being dropped or panicking.
+        ///    lifetime is the value's actual lifetime (borrow checking assumes that diverging code paths
+        ///    obviate the need for something to live for its full duration so long as the drop order
+        ///    preserves the lifetime dependencies), the caller must then guarantee that the future will
+        ///    never terminate without being dropped. Note that *this includes panics, since panics unwind
+        ///    the future before the executor and, even if that weren't true, this structure still needs to
+        ///    be panic-safe.
         ///
         #[inline(always)]
         pub async unsafe fn provide<'a>(
@@ -338,63 +305,56 @@ pub mod macro_internals {
             }
         }
     }
+
+    // === CovariantIterator === //
+
+    // TODO: Justify safety of this type.
+    pub struct CovariantIterator<'a, T> {
+        _ty: PhantomData<&'a mut ()>,
+        data: NonNull<()>,
+        emitter: unsafe fn(NonNull<()>) -> Option<T>,
+    }
+
+    impl<'a, T> CovariantIterator<'a, T> {
+        pub fn new<I: Iterator<Item = T>>(iter: &'a mut I) -> Self {
+            unsafe fn iter_next<I: Iterator>(p: NonNull<()>) -> Option<I::Item> {
+                p.cast::<I>().as_mut().next()
+            }
+
+            Self {
+                _ty: PhantomData,
+                data: NonNull::from(iter).cast::<()>(),
+                emitter: iter_next::<I>,
+            }
+        }
+    }
+
+    impl<T> Iterator for CovariantIterator<'_, T> {
+        type Item = T;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            unsafe { (self.emitter)(self.data) }
+        }
+    }
 }
 
 #[macro_export]
 macro_rules! self_ref {
-    // === Iterator variants === //
+    // === Iterators === //
     (use iter $provided:ident in { $($rest:tt)* }) => {
-        $crate::macro_internals::SelfRef::new(|provider| async move {
-            let mut pointer = &mut ();
-            provider.check_covariance(|_, x| x);
+        $crate::self_ref!(use t in {
             $($rest)*
             {};
-            for value in $provided {
-                unsafe {
-                    // Safety:
-                    //
-                    // 1. `provider` cannot be shadowed by `$rest` so we are indeed operating on
-                    //    the correct type. Additionally, because token trees prevent unbalanced
-                    //    groups and the introduction of new async blocks requires a brace, we
-                    //    know that we are executing directly in the `async` block provided
-                    //    immediately to `SelfRef`.
-                    //
-                    // 2. We already ensured that the `SelfRefOutput` type was covariant with the
-                    //    call to `check_covariance` at the top of the block.
-                    //
-                    // 3. The lifetime bound to `Feed<'a, T>` will definitely be longer than the
-                    //    future's executing lifetime because the `'_` lifetime in `pointer: &'_mut ()`
-                    //    must live until the end of the future block past the `pending().await`
-                    //    and we bind that lifetime to `'a` by passing a mutable reference to that
-                    //    pointer. We know that the future cannot early-return once we start providing
-                    //    things
-                    //
-                    provider.provide(&mut pointer, $crate::macro_internals::re_export::Some(value)).await;
-                };
-            }
-            unsafe {
-                // Safety: see above.
-                provider.provide(&mut pointer, $crate::macro_internals::re_export::None).await
-            };
-            $crate::macro_internals::re_export::pending::<()>().await;
-            drop(pointer);
+            let t = $crate::macro_internals::CovariantIterator::new(&mut $provided);
         })
     };
     (iter for<$lt:lifetime> $ty:ty $(; $future_lt:lifetime)?) => {
-        $crate::self_ref![
-            iter for<$lt> $ty;
-            impl $crate::macro_internals::re_export::Future<Output = ()> $(+ $future_lt)?
-        ]
+        $crate::self_ref![for<$lt> $crate::macro_internals::CovariantIterator<$lt, $ty> $(; $future_lt)?]
     };
     (iter for<$lt:lifetime> $ty:ty ; $future_ty:ty) => {
-        $crate::macro_internals::SelfRef<
-            dyn for<$lt> $crate::macro_internals::SelfRefIterOutput<$lt, IterOutput = $ty>,
-            $future_ty,
-        >
+        $crate::self_ref![for<$lt> $crate::macro_internals::CovariantIterator<$lt, $ty>; $future_ty]
     };
-
-    // === Non-iterator variants === //
-
+    // === Single-element === //
     (use $provided:ident in { $($rest:tt)* }) => {
         $crate::macro_internals::SelfRef::new(|provider| async move {
             let mut pointer = &mut ();
@@ -402,7 +362,25 @@ macro_rules! self_ref {
             $($rest)*
             {};
             unsafe {
-                // Safety: see above.
+                // Safety:
+                //
+                // 1. `provider` cannot be shadowed by `$rest` so we are indeed operating on
+                //    the correct type. Additionally, because token trees prevent unbalanced
+                //    groups and the introduction of new async blocks requires a brace, we
+                //    know that we are executing directly in the `async` block provided
+                //    immediately to `SelfRef`.
+                //
+                // 2. We already ensured that the `SelfRefOutput` type was covariant with the
+                //    call to `check_covariance` at the top of the block.
+                //
+                // 3. The lifetime bound to `Feed<'a, T>` will definitely be longer than the
+                //    future's executing lifetime because the `'_` lifetime in `pointer: &'_mut ()`
+                //    must live until the end of the future block past the `pending().await`
+                //    and we bind that lifetime to `'a` by passing a mutable reference to that
+                //    pointer. We know that the future cannot early-return or panic once we start
+                //    providing things because we exclusively run trusted code up until the
+                //    future's `Drop` handler—when things are explicitly allowed to be dropped.
+                //
                 provider.provide(&mut pointer, $provided).await
             };
             $crate::macro_internals::re_export::pending::<()>().await;
@@ -487,13 +465,13 @@ mod test {
     fn returns_many_things() -> self_ref![iter for<'a> (i32, &'a mut i32)] {
         self_ref!(use iter t in {
             let mut values = [1, 2, 3];
-            let t = values.iter_mut().map(|k| (*k, k));
+            let mut t = values.iter_mut().map(|k| (*k, k));
         })
     }
 
     #[test]
     fn uses_many_things() {
-        for (snapshot, ptr) in pin!(returns_many_things()).iter() {
+        for (snapshot, ptr) in pin!(returns_many_things()).get() {
             println!("{snapshot} {ptr}");
         }
     }
