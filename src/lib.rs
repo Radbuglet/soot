@@ -3,7 +3,7 @@
 #[doc(hidden)]
 pub mod macro_internals {
     use core::{
-        cell::UnsafeCell,
+        cell::RefCell,
         future::Future,
         iter,
         marker::PhantomData,
@@ -13,6 +13,7 @@ pub mod macro_internals {
         task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     };
 
+    /// Re-exports for [`self_ref!`](crate::self_ref).
     pub mod re_export {
         pub use core::{
             future::{pending, Future},
@@ -20,6 +21,7 @@ pub mod macro_internals {
         };
     }
 
+    /// Constructs a dummy waker that does nothing.
     fn dummy_waker() -> ManuallyDrop<Waker> {
         const VTABLE: RawWakerVTable = RawWakerVTable::new(
             |data| RawWaker::new(data, &VTABLE),
@@ -31,13 +33,27 @@ pub mod macro_internals {
         ManuallyDrop::new(unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) })
     }
 
+    /// Fetches the output type of a [`SelfRefOutput`] given the lifetime `'a`.
     type Feed<'a, T> = <T as SelfRefOutput<'a>>::Output;
+
+    /// Fetches the output type of a [`SelfRefIterOutput`] given the lifetime `'a`.
     type FeedIter<'a, T> = <T as SelfRefIterOutput<'a>>::IterOutput;
 
+    /// A trait used to indicate the return type of a [`SelfRef`] given a future lifetime `'a`.
+    ///
+    /// This trait should not be implemented on structures manually but rather referenced as:
+    /// ```ignore
+    /// type MyOutputCollection = dyn for<'a> SelfRefOutput<'a, Output = &'a u32>;
+    /// ```
     pub trait SelfRefOutput<'a> {
-        type Output;
+        type Output; // FIXME: Should this be `'a`?
     }
 
+    /// A trait used to indicate the return type of a [`SelfRef`] being used as an iterator given a
+    /// future lifetime `'a`. Everything that implements [`SelfRefIterOutput`] also implements
+    /// [`SelfRefOutput`] with an output of `Option<IterOutput>`.
+    ///
+    /// See [`SelfRefOutput`] documentation for how to use this trait.
     pub trait SelfRefIterOutput<'a> {
         type IterOutput;
     }
@@ -46,9 +62,16 @@ pub mod macro_internals {
         type Output = Option<T::IterOutput>;
     }
 
+    /// A new-type wrapper around a future producing self-referential data. This is constructed
+    /// safely using the [`self_ref!`](crate::self_ref) macro.
+    ///
+    /// `T` represents the [`dyn for<'a> SelfRefOutput<'a, Output = ...>`](SelfRefOutput) instance
+    /// describing the collection of values this [`SelfRef`] can produce.
+    ///
+    /// `F` represents the [`Future`] being used to produce these values.
     pub struct SelfRef<T: ?Sized, F> {
         _ty: PhantomData<fn(T) -> T>,
-        future: UnsafeCell<F>,
+        future: RefCell<F>,
     }
 
     impl<T, F> SelfRef<T, F>
@@ -56,6 +79,9 @@ pub mod macro_internals {
         T: ?Sized + for<'a> SelfRefOutput<'a>,
         F: Future<Output = ()>,
     {
+        /// Calls a generator closure immediately to produce the future wrapped by [`SelfRef`]. This
+        /// future (the closure body assuming it's all `async`), however, will not process until the
+        /// first call to [`SelfRef::get`] and similar.
         #[inline(always)]
         pub fn new<G>(generator: G) -> Self
         where
@@ -63,14 +89,27 @@ pub mod macro_internals {
         {
             Self {
                 _ty: PhantomData,
-                future: UnsafeCell::new(generator(SelfRefProvider { _ty: PhantomData })),
+                future: RefCell::new(generator(SelfRefProvider { _ty: PhantomData })),
             }
         }
 
         #[inline(always)]
         pub fn get_streaming<'a>(self: Pin<&'a Self>) -> Feed<'a, T> {
-            let future = unsafe { Pin::new_unchecked(&mut *self.future.get()) };
+            // N.B. we use a `RefCell` here because someone could technically call this function
+            // recursively, although they'd have considerable difficulty doing so.
+            let future = &mut *self.future.borrow_mut();
+            let future = unsafe {
+                // Safety: If `F: !Unpin`, then a `Pin` wrapper around a reference guarantees that
+                // our structure, will not be moved. Because we never give out mutable references to
+                // our future to anyone else, the future will also stay put. Huzzah for structural
+                // pinning!
+                Pin::new_unchecked(future)
+            };
 
+            // Construct a waker surrounded by a `SelfRefProviderFuture`. We do this to setup the
+            // invariant that our `context`'s waker is always secretly a pointer to one of these.
+            //
+            // Details on why that invariant can be upheld are described below.
             let dummy_waker = SelfRefProviderFuture::<Feed<'a, T>> {
                 waker: dummy_waker(),
                 output: None,
@@ -79,20 +118,86 @@ pub mod macro_internals {
 
             let mut context = Context::from_waker(&dummy_waker.waker);
 
+            // Poll the future to give it a chance to update the waker.
             let _ = future.poll(&mut context);
 
+            // Extract the `SelfRefProviderFuture` from the `context`'s current `waker`.
             let SelfRefProviderFuture { output, .. } = unsafe {
+                // Safety: here's where things get tricky!
+                //
+                // 1.   First, why can we assume that our `Waker` is secretly a pointer to a
+                //      `SelfRefProviderFuture<U>` for *some* `U`? We already know that the original
+                //      waker starts out as the first field of a `SelfRefProviderFuture`, which is
+                //      `repr(C)`. Additionally, is is `unsafe` and unsound for general executors for
+                //      someone to mutate a `Context` instance and its associated waker. First,
+                //      `Context` only gives getters to these `Waker` references—not setters. Second,
+                //      and more importantly, although `Future`s get mutable references to a
+                //      `Context<'_>`, the context object is invariant w.r.t `'_` and `'_` is
+                //      existential. Since they only receive one context object with that existential
+                //      lifetime, they cannot safely mutate the context. Thus, only an unsafe context
+                //      with a sufficient number of guarantees about its executor could replace our
+                //      waker—that context being `SelfRefProviderFuture::poll()`.
+                //
+                //      TODO: This logic relies on some unstable guarantees of the standard library.
+                //        We currently protect against a breaking of the second guarantee with a
+                //        doc-test (TODO: actually do this) but there's no real way to ensure that
+                //        the standard library never adds a setter for the waker or defines some
+                //        known layout which could be mutated. Luckily, these scenarios are somewhat
+                //        theoretical, pretty unlikely to happen accidentally, and will almost surely
+                //        happen *after* `waker_getters` (#96992) get stabilized.
+                //
+                // 2.   Next, how do we ensure that the `U` in `SelfRefProviderFuture<U>` is assignable
+                //      to `Feed<'a, T>`? Three safety guarantees of `SelfRefProvider::provide()`
+                //      make this possible.
+                //
+                // 2.1. First, `SelfRefProvider::<T>::provide()`—the only constructor for
+                //      `SelfRefProviderFuture<Feed<'a, T>>`—requires callers to guarantee that they
+                //      are executing the future in an `async` block immediately passed to a
+                //      `SelfRef<T, _>` of the same type `T`. Therefore, our waker is pointing to
+                //      `SelfRefProvider<Feed<'b, T>>` for some lifetime `'b`.
+                //
+                // 2.2. Second, `SelfRefProvider::<T>::provide()` requires callers to guarantee that
+                //      `Feed<'c, T>` is covariant w.r.t `'c`. See [`SelfRefProvider::check_covariance`]
+                //      and the expanded output of `crate::self_ref!` for details on how this proof
+                //      is automated.
+                //
+                // 2.3. Third, `SelfRefProvider::<T>::provide()` requires callers to guarantee that
+                //      the lifetime `'b` for which it is being called is only terminated once the
+                //      future is dropped. Because `'a` is strictly less than that (the future can
+                //      only be dropped if its wrapping `SelfRef` is dropped, which would force `'a`
+                //      to expire), we know that `'b: 'a` and, by the covariance of `Feed<'c, T>`
+                //      established prior, we know that `SelfRefProvider<Feed<'b, T>>` is assignable
+                //      to our `SelfRefProvider<Feed<'a, T>>`, as expected.
+                //
+                // 3.   TODO: Justify why this type of C-style structure embedding is valid in Rust—
+                //       even with obnoxious pointer-reference round-tripping. (right now, my only
+                //       source of confidence for this operation is the fact that Miri with
+                //       `MIRIFLAGS=-Zmiri-tree-borrows` environment variables accepts this routine)
+                //
+                // 4.   We keep this reference to our waker for at most the lifetime of our `context`
+                //      object so there are no UAFs to be found here!
+                //
+                // Huzzah!
                 &*(context.waker() as *const Waker as *const SelfRefProviderFuture<Feed<'a, T>>)
             };
 
+            // Extract the output value from the waker.
+            //
+            // N.B. We will never leak with an initialized `MaybeUninit` because nothing can panic
+            // in between the `Pending` resolution of our `SelfRefProviderFuture` and this line because
+            // safe executions of `SelfRefProviderFuture` are expected to yield directly to the `future`
+            // we're executing right now. If this line panics, it will only do so if the option
+            // containing that `MaybeUninit` is `None`, which certainly cannot leak anything.
+            let output = output.as_ref().expect(
+                "`SelfRef` provider never provided a value. Was there an unexpected early \
+                 return or an excess of reads?",
+            );
+
             unsafe {
-                output
-                    .as_ref()
-                    .expect(
-                        "`SelfRef` provider never provided a value. Was there an unexpected early \
-                         return or an excess of reads?",
-                    )
-                    .assume_init_read()
+                // Safety: As a final internal invariant, we know that the `SelfRefProviderFuture`
+                // will only set itself as the waker once. After that, it resolves and lets the next
+                // future handle things.
+                output.assume_init_read()
             }
         }
 
@@ -107,25 +212,41 @@ pub mod macro_internals {
         T: ?Sized + for<'a> SelfRefIterOutput<'a>,
         F: Future<Output = ()>,
     {
+        #[inline(always)]
         pub fn iter_streaming<'a>(
             self: Pin<&'a Self>,
         ) -> impl Iterator<Item = FeedIter<'a, T>> + 'a {
             iter::from_fn(move || self.get_streaming())
         }
 
+        #[inline(always)]
         pub fn iter<'a>(self: Pin<&'a mut Self>) -> impl Iterator<Item = FeedIter<'a, T>> + 'a {
             self.into_ref().iter_streaming()
         }
     }
 
+    /// A helper structure providing access to [`SelfRefOutput`] variance checking and type-safe
+    /// [`provide`](SelfRefProvider::provide) calls.
     pub struct SelfRefProvider<T: ?Sized> {
         _ty: PhantomData<fn(T) -> T>,
     }
 
     impl<T: ?Sized + for<'a> SelfRefOutput<'a>> SelfRefProvider<T> {
+        /// Returns a [`Future`] whose completion provides the given `output` to the calling [`SelfRef`].
+        ///
+        /// ## Safety
+        ///
+        /// 1. This may only be called and `.await`'ed upon directly in the `async` closure owned by
+        ///    the correspondingly-typed `SelfRef<T, _>`.
+        ///
+        /// 2. `Feed<'a, T>` must be covariant w.r.t `'a`.
+        ///
+        /// 3. The lifetime `'_` for the `output: Feed<'_, T>` argument must not expire before the
+        ///    async block in which this future is being `.await`ed is dropped.
+        ///
         #[inline(always)]
         pub async unsafe fn provide(&self, output: Feed<'_, T>) {
-            SelfRefProviderFuture {
+            SelfRefProviderFuture::<Feed<'_, T>> {
                 waker: dummy_waker(),
                 output: Some(MaybeUninit::new(output)),
                 should_wake: false,
@@ -133,13 +254,28 @@ pub mod macro_internals {
             .await;
         }
 
+        /// A helper method to ensure that our specific `Feed<'a, T>` is covariant w.r.t `'a`.
+        ///
+        /// If an identity conversion of the form:
+        ///
+        /// ```ignore
+        /// provider.check_covariance(|_, x| x);
+        /// ```
+        ///
+        /// ...type checks, this implies that `Feed<'a, T>` is covariant.
         pub fn check_covariance(
             &self,
+            // This trick was found courtesy of `Yandros`
+            // Github: https://github.com/danielhenrymantilla
             _: impl for<'l, 's> FnOnce(
+                // This is used to introduce the implication that `'l: 's`.
                 [&'s &'l (); 0],
+                // The double pointer indirection ensures that implicit unsizing and type promotion
+                // conversions do not occur.
                 *const *const Feed<'l, T>,
             ) -> *const *const Feed<'s, T>,
         ) {
+            // (no-op)
         }
     }
 
@@ -163,7 +299,25 @@ pub mod macro_internals {
                 Poll::Ready(())
             } else {
                 me.should_wake = true;
-                *cx = unsafe { transmute(Context::from_waker(&me.waker)) };
+                *cx = unsafe {
+                    // Safety: From the safety guarantees `SelfRefProvider::provide()`—the only
+                    // constructor of this future—we know that we are executing directly in an
+                    // async block owned by an appropriate `SelfRef` wrapper.
+                    //
+                    // This is a transmute from a `Context` to a waker with a lifetime of `dummy_waker`
+                    // in `SelfRef::get_streaming()` to a waker with a lifetime of the future being
+                    // executed from when `future.poll()` terminates to the next `future.poll()` call.
+                    // Hence, we are assigning from a `Context<'a>` to a `Context<'b>` where `'a: 'b`.
+                    //
+                    // Although `Context<'a>` is not technically covariant w.r.t `'a`, this is only
+                    // for future proofing purposes and the structure cannot obtain another
+                    // lifetime-limiting field without an intermediate call to some other setter
+                    // we know neither this method—nor the de-sugared async block—will realistically
+                    // make.
+                    //
+                    // TODO: This last paragraph is also speculation.
+                    transmute(Context::from_waker(&me.waker))
+                };
                 Poll::Pending
             }
         }
@@ -179,9 +333,35 @@ macro_rules! self_ref {
             $($rest)*
             {};
             for value in $provided {
-                unsafe { provider.provide($crate::macro_internals::re_export::Some(value)).await };
+                unsafe {
+                    // Safety:
+                    //
+                    // 1. `provider` cannot be shadowed by `$rest` so we are indeed operating on
+                    //    the correct type. Additionally, because token trees prevent unbalanced
+                    //    groups and the introduction of new async blocks requires a brace, we
+                    //    know that we are executing directly in the `async` block provided
+                    //    immediately to `SelfRef`.
+                    //
+                    // 2. We already ensured that the `SelfRefOutput` type was covariant with the
+                    //    call to `check_covariance` at the top of the block.
+                    //
+                    // 3. `$provided` will not expire until the future is finished, which will never
+                    //    happen unless we're dropped or the iterator panics (and unwinding respects
+                    //    drop order for dependencies due to the lifetimes involved by the return
+                    //    values). Because a type either depends on the input lifetime or a static
+                    //    lifetime (i.e. it certainly can't shrink as our input lifetime grows), we
+                    //    know that the lifetime of our structure is at least the lifetime of the
+                    //    value we passed to it.
+                    //
+                    //    TODO: We need to formalize this statement a bit more.
+                    //
+                    provider.provide($crate::macro_internals::re_export::Some(value)).await
+                };
             }
-            unsafe { provider.provide($crate::macro_internals::re_export::None).await };
+            unsafe {
+                // Safety: see above.
+                provider.provide($crate::macro_internals::re_export::None).await
+            };
             $crate::macro_internals::re_export::pending::<()>().await;
         })
     };
@@ -205,7 +385,10 @@ macro_rules! self_ref {
             provider.check_covariance(|_, x| x);
             $($rest)*
             {};
-            unsafe { provider.provide($provided).await };
+            unsafe {
+                // Safety: see above.
+                provider.provide($provided).await
+            };
             $crate::macro_internals::re_export::pending::<()>().await;
         })
     };
